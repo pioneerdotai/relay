@@ -1,5 +1,5 @@
 use anyhow::{Ok, Result};
-use common::{run_rathole_client, PING, PONG};
+use common::{run_pioneer_relay, run_rathole_client, PING, PONG};
 use rand::Rng;
 use std::time::Duration;
 use tokio::{
@@ -19,6 +19,8 @@ const ECHO_SERVER_ADDR: &str = "127.0.0.1:8080";
 const PINGPONG_SERVER_ADDR: &str = "127.0.0.1:8081";
 const ECHO_SERVER_ADDR_EXPOSED: &str = "127.0.0.1:2334";
 const PINGPONG_SERVER_ADDR_EXPOSED: &str = "127.0.0.1:2335";
+const RELAY_ECHO_SERVER_ADDR: &str = "127.0.0.1:18080";
+const RELAY_INGRESS_ADDR: &str = "127.0.0.1:18082";
 const HITTER_NUM: usize = 4;
 
 #[derive(Clone, Copy, Debug)]
@@ -114,6 +116,46 @@ async fn udp() -> Result<()> {
     #[cfg(not(target_os = "macos"))]
     #[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
     test("tests/for_udp/websocket_tls_transport.toml", Type::Udp).await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn relay() -> Result<()> {
+    init();
+
+    if cfg!(not(all(feature = "client", feature = "server"))) {
+        return Ok(());
+    }
+
+    tokio::spawn(async move {
+        if let Err(e) = common::tcp::echo_server(RELAY_ECHO_SERVER_ADDR).await {
+            panic!("Failed to run the relay echo server for testing: {:?}", e);
+        }
+    });
+
+    let (relay_shutdown_tx, relay_shutdown_rx) = broadcast::channel(1);
+    let (client_shutdown_tx, client_shutdown_rx) = broadcast::channel(1);
+
+    let relay = tokio::spawn(async move {
+        run_pioneer_relay("tests/for_relay/relay.toml", relay_shutdown_rx)
+            .await
+            .unwrap();
+    });
+    time::sleep(Duration::from_millis(250)).await;
+
+    let client = tokio::spawn(async move {
+        run_rathole_client("tests/for_relay/client.toml", client_shutdown_rx)
+            .await
+            .unwrap();
+    });
+    time::sleep(Duration::from_secs(1)).await;
+
+    relay_http_echo_hitter().await?;
+
+    relay_shutdown_tx.send(true)?;
+    client_shutdown_tx.send(true)?;
+    let _ = tokio::join!(relay, client);
 
     Ok(())
 }
@@ -246,6 +288,18 @@ async fn tcp_echo_hitter(addr: &'static str) -> Result<()> {
         conn.read_exact(&mut rd).await?;
         assert_eq!(wr, rd);
     }
+
+    Ok(())
+}
+
+async fn relay_http_echo_hitter() -> Result<()> {
+    let mut conn = TcpStream::connect(RELAY_INGRESS_ADDR).await?;
+    let request = b"GET / HTTP/1.1\r\nHost: UtuWcUQps7w0.GetPioneer.Dev\r\n\r\n";
+    conn.write_all(request).await?;
+
+    let mut response = vec![0u8; request.len()];
+    conn.read_exact(&mut response).await?;
+    assert_eq!(request, response.as_slice());
 
     Ok(())
 }

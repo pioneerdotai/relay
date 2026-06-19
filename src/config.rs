@@ -7,6 +7,7 @@ use std::path::Path;
 use tokio::fs;
 use url::Url;
 
+use crate::token::validate_token_hash;
 use crate::transport::{DEFAULT_KEEPALIVE_INTERVAL, DEFAULT_KEEPALIVE_SECS, DEFAULT_NODELAY};
 
 /// Application-layer heartbeat interval in secs
@@ -40,6 +41,12 @@ impl From<&str> for MaskedString {
     }
 }
 
+impl From<String> for MaskedString {
+    fn from(s: String) -> MaskedString {
+        MaskedString(s)
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Copy, Clone, PartialEq, Eq, Default)]
 pub enum TransportType {
     #[default]
@@ -51,6 +58,15 @@ pub enum TransportType {
     Noise,
     #[serde(rename = "websocket")]
     Websocket,
+}
+
+#[derive(Debug, Serialize, Deserialize, Copy, Clone, PartialEq, Eq, Default)]
+pub enum AuthType {
+    #[default]
+    #[serde(rename = "sha256")]
+    Sha256,
+    #[serde(rename = "token_hash")]
+    TokenHash,
 }
 
 /// Per service config
@@ -66,6 +82,8 @@ pub struct ClientServiceConfig {
     #[serde(default)] // Default to false
     pub prefer_ipv6: bool,
     pub token: Option<MaskedString>,
+    #[serde(default)]
+    pub auth: AuthType,
     pub nodelay: Option<bool>,
     pub retry_interval: Option<u64>,
 }
@@ -217,6 +235,18 @@ fn default_heartbeat_interval() -> u64 {
     DEFAULT_HEARTBEAT_INTERVAL_SECS
 }
 
+fn default_relay_control_addr() -> String {
+    "0.0.0.0:2333".into()
+}
+
+fn default_relay_ingress_addr() -> String {
+    "127.0.0.1:8080".into()
+}
+
+fn default_relay_max_header_bytes() -> usize {
+    16 * 1024
+}
+
 #[derive(Debug, Serialize, Deserialize, Default, PartialEq, Eq, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
@@ -231,9 +261,35 @@ pub struct ServerConfig {
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
 #[serde(deny_unknown_fields)]
+pub struct RelayTunnelConfig {
+    pub id: String,
+    pub url: Url,
+    pub token_hash: MaskedString,
+    pub nodelay: Option<bool>,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct RelayConfig {
+    #[serde(default = "default_relay_control_addr")]
+    pub control_addr: String,
+    #[serde(default = "default_relay_ingress_addr")]
+    pub ingress_addr: String,
+    #[serde(default = "default_relay_max_header_bytes")]
+    pub max_header_bytes: usize,
+    #[serde(default = "default_heartbeat_interval")]
+    pub heartbeat_interval: u64,
+    #[serde(default)]
+    pub transport: TransportConfig,
+    pub tunnels: Vec<RelayTunnelConfig>,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     pub server: Option<ServerConfig>,
     pub client: Option<ClientConfig>,
+    pub relay: Option<RelayConfig>,
 }
 
 impl Config {
@@ -248,8 +304,14 @@ impl Config {
             Config::validate_client_config(client)?;
         }
 
-        if config.server.is_none() && config.client.is_none() {
-            Err(anyhow!("Neither of `[server]` or `[client]` is defined"))
+        if let Some(relay) = config.relay.as_mut() {
+            Config::validate_relay_config(relay)?;
+        }
+
+        if config.server.is_none() && config.client.is_none() && config.relay.is_none() {
+            Err(anyhow!(
+                "Neither of `[server]`, `[client]` or `[relay]` is defined"
+            ))
         } else {
             Ok(config)
         }
@@ -268,6 +330,55 @@ impl Config {
         }
 
         Config::validate_transport_config(&server.transport, true)?;
+
+        Ok(())
+    }
+
+    fn validate_relay_config(relay: &mut RelayConfig) -> Result<()> {
+        if relay.transport.transport_type != TransportType::Tcp {
+            bail!("`[relay]` currently supports raw tcp transport only");
+        }
+
+        if relay.max_header_bytes < 1024 {
+            bail!("`relay.max_header_bytes` must be at least 1024");
+        }
+
+        if relay.tunnels.is_empty() {
+            bail!("`[relay]` requires at least one tunnel");
+        }
+
+        let mut ids = std::collections::HashSet::new();
+        let mut hosts = std::collections::HashSet::new();
+        for tunnel in &relay.tunnels {
+            if tunnel.id.trim().is_empty() {
+                bail!("relay tunnel id must not be empty");
+            }
+            if !ids.insert(tunnel.id.clone()) {
+                bail!("duplicate relay tunnel id `{}`", tunnel.id);
+            }
+
+            if tunnel.url.scheme() != "https" {
+                bail!(
+                    "relay tunnel `{}` must use an https URL, got `{}`",
+                    tunnel.id,
+                    tunnel.url
+                );
+            }
+
+            let host = tunnel
+                .url
+                .host_str()
+                .ok_or_else(|| anyhow!("relay tunnel `{}` URL has no host", tunnel.id))?;
+            if host.contains('*') {
+                bail!("wildcard relay tunnel hosts are not supported yet: `{host}`");
+            }
+            if !hosts.insert(host.to_ascii_lowercase()) {
+                bail!("duplicate relay tunnel host `{host}`");
+            }
+
+            validate_token_hash(&tunnel.token_hash)
+                .with_context(|| format!("invalid token_hash for relay tunnel `{}`", tunnel.id))?;
+        }
 
         Ok(())
     }

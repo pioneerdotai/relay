@@ -206,7 +206,12 @@ fn calculate_events(old: &Config, new: &Config) -> Option<Vec<ConfigChange>> {
 
     if (old.server.is_some() != new.server.is_some())
         || (old.client.is_some() != new.client.is_some())
+        || (old.relay.is_some() != new.relay.is_some())
     {
+        return Some(vec![ConfigChange::General(Box::new(new.clone()))]);
+    }
+
+    if old.relay != new.relay {
         return Some(vec![ConfigChange::General(Box::new(new.clone()))]);
     }
 
@@ -287,10 +292,12 @@ mod test {
                 old: Config {
                     server: Some(Default::default()),
                     client: None,
+                    relay: None,
                 },
                 new: Config {
                     server: Some(Default::default()),
                     client: Some(Default::default()),
+                    relay: None,
                 },
             },
             Test {
@@ -300,6 +307,7 @@ mod test {
                         ..Default::default()
                     }),
                     client: None,
+                    relay: None,
                 },
                 new: Config {
                     server: Some(ServerConfig {
@@ -308,12 +316,14 @@ mod test {
                         ..Default::default()
                     }),
                     client: None,
+                    relay: None,
                 },
             },
             Test {
                 old: Config {
                     server: Some(Default::default()),
                     client: None,
+                    relay: None,
                 },
                 new: Config {
                     server: Some(ServerConfig {
@@ -321,6 +331,7 @@ mod test {
                         ..Default::default()
                     }),
                     client: None,
+                    relay: None,
                 },
             },
             Test {
@@ -330,10 +341,12 @@ mod test {
                         ..Default::default()
                     }),
                     client: None,
+                    relay: None,
                 },
                 new: Config {
                     server: Some(Default::default()),
                     client: None,
+                    relay: None,
                 },
             },
             Test {
@@ -346,6 +359,7 @@ mod test {
                         services: collection!(String::from("foo1") => ClientServiceConfig::with_name("foo1"), String::from("foo2") => ClientServiceConfig::with_name("foo2")),
                         ..Default::default()
                     }),
+                    relay: None,
                 },
                 new: Config {
                     server: Some(ServerConfig {
@@ -356,6 +370,7 @@ mod test {
                         services: collection!(String::from("bar1") => ClientServiceConfig::with_name("bar1"), String::from("bar2") => ClientServiceConfig::with_name("bar2")),
                         ..Default::default()
                     }),
+                    relay: None,
                 },
             },
         ];
@@ -416,10 +431,12 @@ mod test {
                 &Config {
                     server: Default::default(),
                     client: None,
+                    relay: None,
                 },
                 &Config {
                     server: Default::default(),
                     client: None,
+                    relay: None,
                 },
             ),
             None

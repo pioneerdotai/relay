@@ -1,4 +1,6 @@
-use crate::config::{ClientConfig, ClientServiceConfig, Config, ServiceType, TransportType};
+use crate::config::{
+    AuthType, ClientConfig, ClientServiceConfig, Config, ServiceType, TransportType,
+};
 use crate::config_watcher::{ClientServiceChange, ConfigChange};
 use crate::helper::udp_connect;
 use crate::protocol::Hello::{self, *};
@@ -522,10 +524,11 @@ impl<T: 'static + Transport> ControlChannel<T> {
 
         // Send auth
         debug!("Sending auth");
-        let mut concat = Vec::from(self.service.token.as_ref().unwrap().as_bytes());
-        concat.extend_from_slice(&nonce);
-
-        let session_key = protocol::digest(&concat);
+        let token = self.service.token.as_ref().unwrap();
+        let session_key = match self.service.auth {
+            AuthType::Sha256 => crate::token::legacy_response_for_token(token, &nonce),
+            AuthType::TokenHash => crate::token::response_for_token(token, &nonce),
+        };
         let auth = Auth(session_key);
         conn.write_all(&bincode::serialize(&auth).unwrap()).await?;
         conn.flush().await?;

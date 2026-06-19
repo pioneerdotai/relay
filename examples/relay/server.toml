@@ -1,0 +1,8 @@
+[relay]
+control_addr = "0.0.0.0:2333"
+ingress_addr = "127.0.0.1:8080"
+
+[[relay.tunnels]]
+id = "pioneer_gateway"
+url = "https://utuWcUQps7w0.getpioneer.dev"
+token_hash = "sha256:97152d671dadd150bc531cc5f5786bedce03250ef09fb1fa11f33b0bf865c8b1"

@@ -19,7 +19,7 @@ pub type Digest = [u8; HASH_WIDTH_IN_BYTES];
 #[derive(Deserialize, Serialize, Debug)]
 pub enum Hello {
     ControlChannelHello(ProtocolVersion, Digest), // sha256sum(service name) or a nonce
-    DataChannelHello(ProtocolVersion, Digest),    // token provided by CreateDataChannel
+    DataChannelHello(ProtocolVersion, Digest),    // session key provided by CreateDataChannel
 }
 
 #[derive(Deserialize, Serialize, Debug)]

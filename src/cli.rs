@@ -42,7 +42,7 @@ cargo Features:      {}
 #[clap(group(
             ArgGroup::new("cmds")
                 .required(true)
-                .args(&["CONFIG", "genkey"]),
+                .args(&["CONFIG", "genkey", "hash_token"]),
         ))]
 pub struct Cli {
     /// The path to the configuration file
@@ -65,4 +65,8 @@ pub struct Cli {
     /// The DH function to use is x25519
     #[clap(long, arg_enum, value_name = "CURVE")]
     pub genkey: Option<Option<KeypairType>>,
+
+    /// Hash a relay token for use in `[relay.tunnels].token_hash`
+    #[clap(long, value_name = "TOKEN")]
+    pub hash_token: Option<String>,
 }

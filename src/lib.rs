@@ -7,6 +7,7 @@ mod constants;
 mod helper;
 mod multi_map;
 mod protocol;
+mod token;
 mod transport;
 
 pub use cli::Cli;
@@ -27,6 +28,11 @@ use client::run_client;
 mod server;
 #[cfg(feature = "server")]
 use server::run_server;
+
+#[cfg(feature = "server")]
+mod relay;
+#[cfg(feature = "server")]
+use relay::run_relay;
 
 use crate::config_watcher::{ConfigChange, ConfigWatcherHandle};
 
@@ -103,6 +109,11 @@ pub async fn run_with_events(
     shutdown_rx: broadcast::Receiver<bool>,
     event_tx: Option<RatholeEventSender>,
 ) -> Result<()> {
+    if let Some(token) = args.hash_token.as_ref() {
+        println!("{}", crate::token::hash_token(token));
+        return Ok(());
+    }
+
     if args.genkey.is_some() {
         return genkey(args.genkey.unwrap());
     }
@@ -179,6 +190,12 @@ async fn run_instance(
             #[cfg(feature = "server")]
             run_server(config, shutdown_rx, service_update).await
         }
+        RunMode::Relay => {
+            #[cfg(not(feature = "server"))]
+            crate::helper::feature_not_compile("server");
+            #[cfg(feature = "server")]
+            run_relay(config, shutdown_rx, service_update).await
+        }
     }
 }
 
@@ -186,6 +203,7 @@ async fn run_instance(
 enum RunMode {
     Server,
     Client,
+    Relay,
     Undetermine,
 }
 
@@ -197,9 +215,11 @@ fn determine_run_mode(config: &Config, args: &Cli) -> RunMode {
         Client
     } else if args.server {
         Server
+    } else if config.relay.is_some() && config.server.is_none() && config.client.is_none() {
+        Relay
     } else if config.client.is_some() && config.server.is_none() {
         Client
-    } else if config.server.is_some() && config.client.is_none() {
+    } else if config.server.is_some() && config.client.is_none() && config.relay.is_none() {
         Server
     } else {
         Undetermine
@@ -285,6 +305,7 @@ mod tests {
                     true => Some(ClientConfig::default()),
                     false => None,
                 },
+                relay: None,
             };
 
             let args = Cli {

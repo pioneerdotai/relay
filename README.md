@@ -1,4 +1,62 @@
-# rathole
+# Pioneer Relay
+
+Pioneer Relay is an open-source fork of `rathole` focused on SaaS-style
+reverse tunnels. The goal is to keep rathole's raw TCP performance model while
+adding primitives needed by ngrok-like products: a relay registry, exact
+hostname routing and token-hash based tunnel authentication.
+
+The upstream rathole server/client mode is still available. The new `[relay]`
+mode is intended for deployments where users get a public URL such as
+`https://utuWcUQps7w0.getpioneer.dev` and a high-entropy `token`, while the
+relay stores only `token_hash`.
+
+Treat `token_hash` as a relay-side secret verifier. It avoids storing the raw
+token, but the registry is still sensitive operational config.
+
+Current relay MVP:
+
+- raw TCP control/data channels; no WebSocket transport in the relay path
+- one global ingress listener instead of one public port per user
+- exact hostname registry, no wildcard matching yet
+- `token_hash = "sha256:<hex>"` on the relay, raw `token` on the client
+- no slow hash step in the relay path
+
+Generate a relay token hash:
+
+```bash
+./rathole --hash-token '<512-bit-token>'
+```
+
+Relay server example:
+
+```toml
+[relay]
+control_addr = "0.0.0.0:2333"
+ingress_addr = "127.0.0.1:8080"
+
+[[relay.tunnels]]
+id = "pioneer_gateway"
+url = "https://utuWcUQps7w0.getpioneer.dev"
+token_hash = "sha256:97152d671dadd150bc531cc5f5786bedce03250ef09fb1fa11f33b0bf865c8b1"
+```
+
+Gateway/client example:
+
+```toml
+[client]
+remote_addr = "relay-eu-west-1.getpioneer.dev:2333"
+
+[client.services.pioneer_gateway]
+auth = "token_hash"
+token = "replace-with-512-bit-token"
+local_addr = "127.0.0.1:17878"
+```
+
+Put an HTTPS edge such as nginx/Caddy in front of `ingress_addr` and preserve
+the `Host` header. The relay routes by exact hostname and then forwards the
+connection over rathole data channels.
+
+## Upstream rathole
 
 ![rathole-logo](./docs/img/rathole-logo.png)
 
@@ -17,7 +75,8 @@ rathole, like [frp](https://github.com/fatedier/frp) and [ngrok](https://github.
 
 <!-- TOC -->
 
-- [rathole](#rathole)
+- [Pioneer Relay](#pioneer-relay)
+  - [Upstream rathole](#upstream-rathole)
   - [Features](#features)
   - [Quickstart](#quickstart)
   - [Configuration](#configuration)

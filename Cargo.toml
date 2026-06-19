@@ -2,10 +2,10 @@
 name = "rathole"
 version = "0.5.0"
 edition = "2021"
-authors = ["Yujia Qiao <code@rapiz.me>"]
-description = "A reverse proxy for NAT traversal"
+authors = ["Yujia Qiao <code@rapiz.me>", "Pioneer Contributors"]
+description = "A reverse proxy and SaaS relay for NAT traversal"
 license = "Apache-2.0"
-repository = "https://github.com/rapiz1/rathole"
+repository = "https://github.com/pioneerdotai/relay"
 readme = "README.md"
 build = "build.rs"
 include = ["src/**/*", "LICENSE", "README.md", "build.rs"]

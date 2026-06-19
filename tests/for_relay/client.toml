@@ -1,0 +1,7 @@
+[client]
+remote_addr = "127.0.0.1:12333"
+
+[client.services.pioneer_gateway]
+auth = "token_hash"
+token = "test-relay-token"
+local_addr = "127.0.0.1:18080"

@@ -1,0 +1,7 @@
+[client]
+remote_addr = "relay-eu-west-1.getpioneer.dev:2333"
+
+[client.services.pioneer_gateway]
+auth = "token_hash"
+token = "replace-with-512-bit-token"
+local_addr = "127.0.0.1:17878"
