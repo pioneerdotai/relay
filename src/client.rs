@@ -7,6 +7,7 @@ use crate::protocol::{
     DataChannelCmd, UdpTraffic, CURRENT_PROTO_VERSION, HASH_WIDTH_IN_BYTES,
 };
 use crate::transport::{AddrMaybeCached, SocketOpts, TcpTransport, Transport};
+use crate::{RatholeClientEvent, RatholeEvent, RatholeEventSender};
 use anyhow::{anyhow, bail, Context, Result};
 use backoff::backoff::Backoff;
 use backoff::future::retry_notify;
@@ -35,6 +36,7 @@ pub async fn run_client(
     config: Config,
     shutdown_rx: broadcast::Receiver<bool>,
     update_rx: mpsc::Receiver<ConfigChange>,
+    event_tx: Option<RatholeEventSender>,
 ) -> Result<()> {
     let config = config.client.ok_or_else(|| {
         anyhow!(
@@ -44,13 +46,13 @@ pub async fn run_client(
 
     match config.transport.transport_type {
         TransportType::Tcp => {
-            let mut client = Client::<TcpTransport>::from(config).await?;
+            let mut client = Client::<TcpTransport>::from(config, event_tx).await?;
             client.run(shutdown_rx, update_rx).await
         }
         TransportType::Tls => {
             #[cfg(any(feature = "native-tls", feature = "rustls"))]
             {
-                let mut client = Client::<TlsTransport>::from(config).await?;
+                let mut client = Client::<TlsTransport>::from(config, event_tx).await?;
                 client.run(shutdown_rx, update_rx).await
             }
             #[cfg(not(any(feature = "native-tls", feature = "rustls")))]
@@ -59,7 +61,7 @@ pub async fn run_client(
         TransportType::Noise => {
             #[cfg(feature = "noise")]
             {
-                let mut client = Client::<NoiseTransport>::from(config).await?;
+                let mut client = Client::<NoiseTransport>::from(config, event_tx).await?;
                 client.run(shutdown_rx, update_rx).await
             }
             #[cfg(not(feature = "noise"))]
@@ -68,7 +70,7 @@ pub async fn run_client(
         TransportType::Websocket => {
             #[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
             {
-                let mut client = Client::<WebsocketTransport>::from(config).await?;
+                let mut client = Client::<WebsocketTransport>::from(config, event_tx).await?;
                 client.run(shutdown_rx, update_rx).await
             }
             #[cfg(not(any(feature = "websocket-native-tls", feature = "websocket-rustls")))]
@@ -85,17 +87,19 @@ struct Client<T: Transport> {
     config: ClientConfig,
     service_handles: HashMap<String, ControlChannelHandle>,
     transport: Arc<T>,
+    event_tx: Option<RatholeEventSender>,
 }
 
 impl<T: 'static + Transport> Client<T> {
     // Create a Client from `[client]` config block
-    async fn from(config: ClientConfig) -> Result<Client<T>> {
+    async fn from(config: ClientConfig, event_tx: Option<RatholeEventSender>) -> Result<Client<T>> {
         let transport =
             Arc::new(T::new(&config.transport).with_context(|| "Failed to create the transport")?);
         Ok(Client {
             config,
             service_handles: HashMap::new(),
             transport,
+            event_tx,
         })
     }
 
@@ -112,6 +116,7 @@ impl<T: 'static + Transport> Client<T> {
                 self.config.remote_addr.clone(),
                 self.transport.clone(),
                 self.config.heartbeat_timeout,
+                self.event_tx.clone(),
             );
             self.service_handles.insert(name.clone(), handle);
         }
@@ -154,6 +159,7 @@ impl<T: 'static + Transport> Client<T> {
                         self.config.remote_addr.clone(),
                         self.transport.clone(),
                         self.config.heartbeat_timeout,
+                        self.event_tx.clone(),
                     );
                     let _ = self.service_handles.insert(name, handle);
                 }
@@ -227,7 +233,8 @@ async fn run_data_channel<T: Transport>(args: Arc<RunDataChannelArgs<T>>) -> Res
             if args.service.service_type != ServiceType::Udp {
                 bail!("Expect UDP traffic. Please check the configuration.")
             }
-            run_data_channel_for_udp::<T>(conn, &args.service.local_addr, args.service.prefer_ipv6).await?;
+            run_data_channel_for_udp::<T>(conn, &args.service.local_addr, args.service.prefer_ipv6)
+                .await?;
         }
     }
     Ok(())
@@ -255,7 +262,11 @@ async fn run_data_channel_for_tcp<T: Transport>(
 type UdpPortMap = Arc<RwLock<HashMap<SocketAddr, mpsc::Sender<Bytes>>>>;
 
 #[instrument(skip(conn))]
-async fn run_data_channel_for_udp<T: Transport>(conn: T::Stream, local_addr: &str, prefer_ipv6: bool) -> Result<()> {
+async fn run_data_channel_for_udp<T: Transport>(
+    conn: T::Stream,
+    local_addr: &str,
+    prefer_ipv6: bool,
+) -> Result<()> {
     debug!("New data channel starts forwarding");
 
     let port_map: UdpPortMap = Arc::new(RwLock::new(HashMap::new()));
@@ -392,6 +403,7 @@ struct ControlChannel<T: Transport> {
     remote_addr: String,                // `client.remote_addr`
     transport: Arc<T>,                  // Wrapper around the transport layer
     heartbeat_timeout: u64,             // Application layer heartbeat timeout in secs
+    event_tx: Option<RatholeEventSender>,
 }
 
 // Handle of a control channel
@@ -403,6 +415,13 @@ struct ControlChannelHandle {
 impl<T: 'static + Transport> ControlChannel<T> {
     #[instrument(skip_all)]
     async fn run(&mut self) -> Result<()> {
+        send_client_event(
+            &self.event_tx,
+            RatholeClientEvent::ControlChannelConnecting {
+                service_name: self.service.name.clone(),
+            },
+        );
+
         let mut remote_addr = AddrMaybeCached::new(&self.remote_addr);
         remote_addr.resolve().await?;
 
@@ -444,14 +463,38 @@ impl<T: 'static + Transport> ControlChannel<T> {
         debug!("Reading ack");
         match read_ack(&mut conn).await? {
             Ack::Ok => {}
-            v => {
-                return Err(anyhow!("{}", v))
-                    .with_context(|| format!("Authentication failed: {}", self.service.name));
+            Ack::AuthFailed => {
+                let error = format!("Authentication failed: {}", self.service.name);
+                send_client_event(
+                    &self.event_tx,
+                    RatholeClientEvent::ControlChannelAuthFailed {
+                        service_name: self.service.name.clone(),
+                        error: error.clone(),
+                    },
+                );
+                return Err(anyhow!("{}", Ack::AuthFailed)).with_context(|| error);
+            }
+            Ack::ServiceNotExist => {
+                let error = format!("Service does not exist: {}", self.service.name);
+                send_client_event(
+                    &self.event_tx,
+                    RatholeClientEvent::ControlChannelServiceNotExist {
+                        service_name: self.service.name.clone(),
+                        error: error.clone(),
+                    },
+                );
+                return Err(anyhow!("{}", Ack::ServiceNotExist)).with_context(|| error);
             }
         }
 
         // Channel ready
         info!("Control channel established");
+        send_client_event(
+            &self.event_tx,
+            RatholeClientEvent::ControlChannelConnected {
+                service_name: self.service.name.clone(),
+            },
+        );
 
         // Socket options for the data channel
         let socket_opts = SocketOpts::from_client_cfg(&self.service);
@@ -490,6 +533,12 @@ impl<T: 'static + Transport> ControlChannel<T> {
         }
 
         info!("Control channel shutdown");
+        send_client_event(
+            &self.event_tx,
+            RatholeClientEvent::ControlChannelStopped {
+                service_name: self.service.name.clone(),
+            },
+        );
         Ok(())
     }
 }
@@ -501,7 +550,9 @@ impl ControlChannelHandle {
         remote_addr: String,
         transport: Arc<T>,
         heartbeat_timeout: u64,
+        event_tx: Option<RatholeEventSender>,
     ) -> ControlChannelHandle {
+        let service_name = service.name.clone();
         let digest = protocol::digest(service.name.as_bytes());
 
         info!("Starting {}", hex::encode(digest));
@@ -516,6 +567,7 @@ impl ControlChannelHandle {
             remote_addr,
             transport,
             heartbeat_timeout,
+            event_tx: event_tx.clone(),
         };
 
         tokio::spawn(
@@ -537,7 +589,18 @@ impl ControlChannelHandle {
                     }
 
                     if let Some(duration) = retry_backoff.next_backoff() {
-                        error!("{:#}. Retry in {:?}...", err, duration);
+                        let error = format!("{err:#}");
+                        if should_publish_reconnecting_event(error.as_str()) {
+                            send_client_event(
+                                &event_tx,
+                                RatholeClientEvent::ControlChannelReconnecting {
+                                    service_name: service_name.clone(),
+                                    error: error.clone(),
+                                    retry_after_millis: duration_as_millis_u64(duration),
+                                },
+                            );
+                        }
+                        error!("{error}. Retry in {:?}...", duration);
                         time::sleep(duration).await;
                     } else {
                         // Should never reach
@@ -557,4 +620,18 @@ impl ControlChannelHandle {
         // A send failure shows that the actor has already shutdown.
         let _ = self.shutdown_tx.send(0u8);
     }
+}
+
+fn send_client_event(event_tx: &Option<RatholeEventSender>, event: RatholeClientEvent) {
+    if let Some(event_tx) = event_tx {
+        let _ = event_tx.send(RatholeEvent::Client(event));
+    }
+}
+
+fn duration_as_millis_u64(duration: Duration) -> u64 {
+    duration.as_millis().try_into().unwrap_or(u64::MAX)
+}
+
+fn should_publish_reconnecting_event(error: &str) -> bool {
+    !error.contains("Incorrect token") && !error.contains("Service not exist")
 }

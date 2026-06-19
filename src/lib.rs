@@ -1,3 +1,5 @@
+#![allow(dead_code, unused_imports, unused_variables)]
+
 mod cli;
 mod config;
 mod config_watcher;
@@ -27,6 +29,39 @@ mod server;
 use server::run_server;
 
 use crate::config_watcher::{ConfigChange, ConfigWatcherHandle};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RatholeEvent {
+    Client(RatholeClientEvent),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RatholeClientEvent {
+    ControlChannelConnecting {
+        service_name: String,
+    },
+    ControlChannelConnected {
+        service_name: String,
+    },
+    ControlChannelReconnecting {
+        service_name: String,
+        error: String,
+        retry_after_millis: u64,
+    },
+    ControlChannelAuthFailed {
+        service_name: String,
+        error: String,
+    },
+    ControlChannelServiceNotExist {
+        service_name: String,
+        error: String,
+    },
+    ControlChannelStopped {
+        service_name: String,
+    },
+}
+
+pub type RatholeEventSender = mpsc::UnboundedSender<RatholeEvent>;
 
 const DEFAULT_CURVE: KeypairType = KeypairType::X25519;
 
@@ -60,6 +95,14 @@ fn genkey(curve: Option<KeypairType>) -> Result<()> {
 }
 
 pub async fn run(args: Cli, shutdown_rx: broadcast::Receiver<bool>) -> Result<()> {
+    run_with_events(args, shutdown_rx, None).await
+}
+
+pub async fn run_with_events(
+    args: Cli,
+    shutdown_rx: broadcast::Receiver<bool>,
+    event_tx: Option<RatholeEventSender>,
+) -> Result<()> {
     if args.genkey.is_some() {
         return genkey(args.genkey.unwrap());
     }
@@ -96,6 +139,7 @@ pub async fn run(args: Cli, shutdown_rx: broadcast::Receiver<bool>) -> Result<()
                         args.clone(),
                         shutdown_tx.subscribe(),
                         service_update_rx,
+                        event_tx.clone(),
                     )),
                     service_update_tx,
                 ));
@@ -119,6 +163,7 @@ async fn run_instance(
     args: Cli,
     shutdown_rx: broadcast::Receiver<bool>,
     service_update: mpsc::Receiver<ConfigChange>,
+    event_tx: Option<RatholeEventSender>,
 ) -> Result<()> {
     match determine_run_mode(&config, &args) {
         RunMode::Undetermine => panic!("Cannot determine running as a server or a client"),
@@ -126,7 +171,7 @@ async fn run_instance(
             #[cfg(not(feature = "client"))]
             crate::helper::feature_not_compile("client");
             #[cfg(feature = "client")]
-            run_client(config, shutdown_rx, service_update).await
+            run_client(config, shutdown_rx, service_update, event_tx).await
         }
         RunMode::Server => {
             #[cfg(not(feature = "server"))]
