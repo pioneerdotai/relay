@@ -82,6 +82,8 @@ pub async fn run_client(
 type ServiceDigest = protocol::Digest;
 type Nonce = protocol::Digest;
 
+const CONTROL_CHANNEL_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
 // Holds the state of a client
 struct Client<T: Transport> {
     config: ClientConfig,
@@ -422,6 +424,75 @@ impl<T: 'static + Transport> ControlChannel<T> {
             },
         );
 
+        let (mut conn, session_key, remote_addr) = time::timeout(
+            CONTROL_CHANNEL_HANDSHAKE_TIMEOUT,
+            self.establish_control_channel(),
+        )
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "Control channel handshake with {} timed out after {:?}",
+                self.remote_addr,
+                CONTROL_CHANNEL_HANDSHAKE_TIMEOUT
+            )
+        })??;
+
+        // Channel ready
+        info!("Control channel established");
+        send_client_event(
+            &self.event_tx,
+            RatholeClientEvent::ControlChannelConnected {
+                service_name: self.service.name.clone(),
+            },
+        );
+
+        // Socket options for the data channel
+        let socket_opts = SocketOpts::from_client_cfg(&self.service);
+        let data_ch_args = Arc::new(RunDataChannelArgs {
+            session_key,
+            remote_addr,
+            connector: self.transport.clone(),
+            socket_opts,
+            service: self.service.clone(),
+        });
+
+        loop {
+            tokio::select! {
+                val = read_control_cmd(&mut conn) => {
+                    let val = val?;
+                    debug!( "Received {:?}", val);
+                    match val {
+                        ControlChannelCmd::CreateDataChannel => {
+                            let args = data_ch_args.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = run_data_channel(args).await.with_context(|| "Failed to run the data channel") {
+                                    warn!("{:#}", e);
+                                }
+                            }.instrument(Span::current()));
+                        },
+                        ControlChannelCmd::HeartBeat => ()
+                    }
+                },
+                _ = time::sleep(Duration::from_secs(self.heartbeat_timeout)), if self.heartbeat_timeout != 0 => {
+                    return Err(anyhow!("Heartbeat timed out"))
+                }
+                _ = &mut self.shutdown_rx => {
+                    break;
+                }
+            }
+        }
+
+        info!("Control channel shutdown");
+        send_client_event(
+            &self.event_tx,
+            RatholeClientEvent::ControlChannelStopped {
+                service_name: self.service.name.clone(),
+            },
+        );
+        Ok(())
+    }
+
+    async fn establish_control_channel(&self) -> Result<(T::Stream, Nonce, AddrMaybeCached)> {
         let mut remote_addr = AddrMaybeCached::new(&self.remote_addr);
         remote_addr.resolve().await?;
 
@@ -487,59 +558,7 @@ impl<T: 'static + Transport> ControlChannel<T> {
             }
         }
 
-        // Channel ready
-        info!("Control channel established");
-        send_client_event(
-            &self.event_tx,
-            RatholeClientEvent::ControlChannelConnected {
-                service_name: self.service.name.clone(),
-            },
-        );
-
-        // Socket options for the data channel
-        let socket_opts = SocketOpts::from_client_cfg(&self.service);
-        let data_ch_args = Arc::new(RunDataChannelArgs {
-            session_key,
-            remote_addr,
-            connector: self.transport.clone(),
-            socket_opts,
-            service: self.service.clone(),
-        });
-
-        loop {
-            tokio::select! {
-                val = read_control_cmd(&mut conn) => {
-                    let val = val?;
-                    debug!( "Received {:?}", val);
-                    match val {
-                        ControlChannelCmd::CreateDataChannel => {
-                            let args = data_ch_args.clone();
-                            tokio::spawn(async move {
-                                if let Err(e) = run_data_channel(args).await.with_context(|| "Failed to run the data channel") {
-                                    warn!("{:#}", e);
-                                }
-                            }.instrument(Span::current()));
-                        },
-                        ControlChannelCmd::HeartBeat => ()
-                    }
-                },
-                _ = time::sleep(Duration::from_secs(self.heartbeat_timeout)), if self.heartbeat_timeout != 0 => {
-                    return Err(anyhow!("Heartbeat timed out"))
-                }
-                _ = &mut self.shutdown_rx => {
-                    break;
-                }
-            }
-        }
-
-        info!("Control channel shutdown");
-        send_client_event(
-            &self.event_tx,
-            RatholeClientEvent::ControlChannelStopped {
-                service_name: self.service.name.clone(),
-            },
-        );
-        Ok(())
+        Ok((conn, session_key, remote_addr))
     }
 }
 
