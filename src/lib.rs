@@ -104,6 +104,55 @@ pub async fn run(args: Cli, shutdown_rx: broadcast::Receiver<bool>) -> Result<()
     run_with_events(args, shutdown_rx, None).await
 }
 
+pub async fn run_config(
+    config: Config,
+    args: Cli,
+    shutdown_rx: broadcast::Receiver<bool>,
+) -> Result<()> {
+    run_config_with_events(config, args, shutdown_rx, None).await
+}
+
+pub async fn run_config_with_events(
+    config: Config,
+    args: Cli,
+    mut shutdown_rx: broadcast::Receiver<bool>,
+    event_tx: Option<RatholeEventSender>,
+) -> Result<()> {
+    if let Some(token) = args.hash_token.as_ref() {
+        println!("{}", crate::token::hash_token(token));
+        return Ok(());
+    }
+
+    if args.genkey.is_some() {
+        return genkey(args.genkey.unwrap());
+    }
+
+    fdlimit::raise_fd_limit();
+    debug!("{:?}", config);
+
+    let (shutdown_tx, _) = broadcast::channel(1);
+    let (_service_update_tx, service_update_rx) = mpsc::channel(1024);
+    let mut instance = tokio::spawn(run_instance(
+        config,
+        args,
+        shutdown_tx.subscribe(),
+        service_update_rx,
+        event_tx,
+    ));
+
+    tokio::select! {
+        result = &mut instance => {
+            result??;
+        }
+        _ = shutdown_rx.recv() => {
+            let _ = shutdown_tx.send(true);
+            instance.await??;
+        }
+    }
+
+    Ok(())
+}
+
 pub async fn run_with_events(
     args: Cli,
     shutdown_rx: broadcast::Receiver<bool>,
