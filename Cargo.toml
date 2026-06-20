@@ -132,7 +132,6 @@ openssl = { version = "0.10", features = ["vendored"], optional = true }
 [build-dependencies]
 vergen = { version = "7.4.2", default-features = false, features = [
     "build",
-    "git",
     "cargo",
 ] }
 anyhow = "1.0"
