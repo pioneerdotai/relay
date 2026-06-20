@@ -42,7 +42,7 @@ cargo Features:      {}
 #[clap(group(
             ArgGroup::new("cmds")
                 .required(true)
-                .args(&["CONFIG", "genkey", "hash_token"]),
+                .args(&["CONFIG", "genkey", "hash-token"]),
         ))]
 pub struct Cli {
     /// The path to the configuration file
