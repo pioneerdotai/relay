@@ -7,12 +7,12 @@ use std::path::Path;
 use tokio::fs;
 use url::Url;
 
-use crate::token::validate_token_hash;
 use crate::transport::{DEFAULT_KEEPALIVE_INTERVAL, DEFAULT_KEEPALIVE_SECS, DEFAULT_NODELAY};
 
 /// Application-layer heartbeat interval in secs
 const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = 30;
 const DEFAULT_HEARTBEAT_TIMEOUT_SECS: u64 = 40;
+const MAX_RELAY_HEADER_BYTES: usize = 64 * 1024;
 
 /// Client
 const DEFAULT_CLIENT_RETRY_INTERVAL_SECS: u64 = 1;
@@ -339,8 +339,8 @@ impl Config {
             bail!("`[relay]` currently supports raw tcp transport only");
         }
 
-        if relay.max_header_bytes < 1024 {
-            bail!("`relay.max_header_bytes` must be at least 1024");
+        if !(1024..=MAX_RELAY_HEADER_BYTES).contains(&relay.max_header_bytes) {
+            bail!("`relay.max_header_bytes` must be between 1024 and {MAX_RELAY_HEADER_BYTES}");
         }
 
         if relay.tunnels.is_empty() {
@@ -349,6 +349,7 @@ impl Config {
 
         let mut ids = std::collections::HashSet::new();
         let mut hosts = std::collections::HashSet::new();
+        let mut token_ids = std::collections::HashSet::new();
         for tunnel in &relay.tunnels {
             if tunnel.id.trim().is_empty() {
                 bail!("relay tunnel id must not be empty");
@@ -364,6 +365,16 @@ impl Config {
                     tunnel.url
                 );
             }
+            if !tunnel.url.username().is_empty()
+                || tunnel.url.password().is_some()
+                || tunnel.url.query().is_some()
+                || tunnel.url.fragment().is_some()
+            {
+                bail!(
+                    "relay tunnel `{}` URL must not contain credentials, a query, or a fragment",
+                    tunnel.id
+                );
+            }
 
             let host = tunnel
                 .url
@@ -376,8 +387,11 @@ impl Config {
                 bail!("duplicate relay tunnel host `{host}`");
             }
 
-            validate_token_hash(&tunnel.token_hash)
+            let token_hash = crate::token::parse_token_hash(&tunnel.token_hash)
                 .with_context(|| format!("invalid token_hash for relay tunnel `{}`", tunnel.id))?;
+            if !token_ids.insert(crate::token::routing_id_for_token_hash(&token_hash)) {
+                bail!("duplicate relay token: each tunnel must have its own key");
+            }
         }
 
         Ok(())
@@ -603,5 +617,55 @@ mod tests {
             "4"
         );
         Ok(())
+    }
+
+    #[test]
+    fn relay_header_bound_rejects_unbounded_configuration() {
+        let relay_config = |max_header_bytes: usize| {
+            format!(
+                r#"
+[relay]
+max_header_bytes = {max_header_bytes}
+
+[[relay.tunnels]]
+id = "gateway"
+url = "https://gateway.example.invalid"
+token_hash = "sha256:97152d671dadd150bc531cc5f5786bedce03250ef09fb1fa11f33b0bf865c8b1"
+"#
+            )
+        };
+
+        assert!(Config::from_str(relay_config(1024).as_str()).is_ok());
+        assert!(Config::from_str(relay_config(MAX_RELAY_HEADER_BYTES).as_str()).is_ok());
+        assert!(Config::from_str(relay_config(1023).as_str()).is_err());
+        assert!(Config::from_str(relay_config(MAX_RELAY_HEADER_BYTES + 1).as_str()).is_err());
+    }
+
+    #[test]
+    fn relay_tunnel_url_rejects_non_routing_components() {
+        let relay_config = |url: &str| {
+            format!(
+                r#"
+[relay]
+
+[[relay.tunnels]]
+id = "gateway"
+url = "{url}"
+token_hash = "sha256:97152d671dadd150bc531cc5f5786bedce03250ef09fb1fa11f33b0bf865c8b1"
+"#
+            )
+        };
+
+        assert!(Config::from_str(
+            relay_config("https://gateway.example.invalid/pioneer/").as_str()
+        )
+        .is_ok());
+        for rejected in [
+            "https://user@gateway.example.invalid",
+            "https://gateway.example.invalid?route=other",
+            "https://gateway.example.invalid#other",
+        ] {
+            assert!(Config::from_str(relay_config(rejected).as_str()).is_err());
+        }
     }
 }

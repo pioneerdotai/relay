@@ -1,6 +1,6 @@
 [package]
 name = "rathole"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 authors = ["Yujia Qiao <code@rapiz.me>", "Pioneer Contributors"]
 description = "A reverse proxy and SaaS relay for NAT traversal"
@@ -135,3 +135,6 @@ vergen = { version = "7.4.2", default-features = false, features = [
     "cargo",
 ] }
 anyhow = "1.0"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }

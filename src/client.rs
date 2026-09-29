@@ -575,7 +575,12 @@ impl ControlChannelHandle {
         event_tx: Option<RatholeEventSender>,
     ) -> ControlChannelHandle {
         let service_name = service.name.clone();
-        let digest = protocol::digest(service.name.as_bytes());
+        let digest = match service.auth {
+            AuthType::TokenHash => {
+                crate::token::routing_id_for_token(service.token.as_ref().unwrap())
+            }
+            AuthType::Sha256 => protocol::digest(service.name.as_bytes()),
+        };
 
         info!("Starting {}", hex::encode(digest));
         let (shutdown_tx, shutdown_rx) = oneshot::channel();

@@ -1,5 +1,5 @@
 use crate::protocol::{digest, Digest, HASH_WIDTH_IN_BYTES};
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, Context, Result};
 
 pub const TOKEN_HASH_PREFIX: &str = "sha256:";
 
@@ -9,6 +9,16 @@ pub fn hash_token(token: &str) -> String {
         TOKEN_HASH_PREFIX,
         hex::encode(digest(token.as_bytes()))
     )
+}
+
+/// Public routing id, domain-separated from the secret authentication verifier.
+/// Never send the raw token_hash: possession of that verifier permits authentication.
+pub fn routing_id_for_token(token: &str) -> Digest {
+    routing_id_for_token_hash(&digest(token.as_bytes()))
+}
+
+pub fn routing_id_for_token_hash(token_hash: &Digest) -> Digest {
+    digest_pair(b"relay/token-routing/v1\0", token_hash)
 }
 
 pub fn parse_token_hash(value: &str) -> Result<Digest> {
@@ -44,12 +54,6 @@ fn digest_pair(left: &[u8], right: &[u8]) -> Digest {
         .chain_update(right)
         .finalize()
         .into()
-}
-
-pub fn validate_token_hash(value: &str) -> Result<()> {
-    parse_token_hash(value).map(|_| ()).or_else(|err| {
-        bail!("{err:#}. Generate a relay token hash with `rathole --hash-token <token>`")
-    })
 }
 
 #[cfg(test)]

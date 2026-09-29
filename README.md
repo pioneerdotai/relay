@@ -19,6 +19,7 @@ Current relay MVP:
 - one global ingress listener instead of one public port per user
 - exact hostname registry, no wildcard matching yet
 - `token_hash = "sha256:<hex>"` on the relay, raw `token` on the client
+- `auth = "token_hash"` selects a tunnel by key; client service names are local labels
 - no slow hash step in the relay path
 
 Generate a relay token hash:
@@ -52,9 +53,33 @@ token = "replace-with-512-bit-token"
 local_addr = "127.0.0.1:17878"
 ```
 
+With `auth = "token_hash"`, clients can use the same local service name. The key selects the tunnel; `relay.tunnels.id` remains an
+internal registry name and does not need to match the client. Each tunnel must
+have a distinct key. Existing registry files and stored token hashes need no
+migration unless they reuse a key across tunnels (now rejected as ambiguous).
+
+The client sends a public routing id, computed as
+`SHA256("relay/token-routing/v1\0" || SHA256(token))`, where `\0` is one
+zero byte. This id is **not** the stored token hash. Sending the stored hash would
+expose a credential capable of generating authentication responses. After lookup,
+the relay still verifies the response to a fresh random challenge before accepting
+the connection. Lookup uses a hash index rather than scanning registered keys.
+
+Relay and its clients must be updated together. The existing `auth = "token_hash"`
+mode and `ControlChannelHello` now use the token routing id in place of the
+service-name digest. There is no service-name lookup or fallback in Relay.
+Older clients cannot authenticate to the updated Relay.
+
 Put an HTTPS edge such as nginx/Caddy in front of `ingress_addr` and preserve
 the `Host` header. The relay routes by exact hostname and then forwards the
 connection over rathole data channels.
+
+For a single-origin Pioneer Gateway deployment with a custom public prefix,
+see [`examples/relay/pioneer-nginx.conf`](examples/relay/pioneer-nginx.conf).
+It keeps root WSS and `/storage/...` on one tunnel, strips only the configured
+public prefix, disables response/request buffering for streams, replaces the
+forwarded client address, removes Cookie, and redacts view-grant paths in its
+access-log projection. It is a static template, not an active configuration.
 
 ## Upstream rathole
 
