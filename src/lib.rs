@@ -132,21 +132,21 @@ pub async fn run_config_with_events(
 
     let (shutdown_tx, _) = broadcast::channel(1);
     let (_service_update_tx, service_update_rx) = mpsc::channel(1024);
-    let mut instance = tokio::spawn(run_instance(
+    // Keep the instance in this future so dropping the caller cannot detach it.
+    let instance = run_instance(
         config,
         args,
         shutdown_tx.subscribe(),
         service_update_rx,
         event_tx,
-    ));
+    );
+    tokio::pin!(instance);
 
     tokio::select! {
-        result = &mut instance => {
-            result??;
-        }
+        result = &mut instance => result?,
         _ = shutdown_rx.recv() => {
             let _ = shutdown_tx.send(true);
-            instance.await??;
+            instance.await?;
         }
     }
 
