@@ -21,6 +21,7 @@ use std::sync::Arc;
 use tokio::io::{self, copy_bidirectional, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
+use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{self, Duration, Instant};
 use tracing::{debug, error, info, instrument, trace, warn, Instrument, Span};
 
@@ -147,7 +148,7 @@ impl<T: 'static + Transport> Client<T> {
 
         // Shutdown all services
         for (_, handle) in self.service_handles.drain() {
-            handle.shutdown();
+            handle.shutdown().await;
         }
 
         Ok(())
@@ -158,6 +159,9 @@ impl<T: 'static + Transport> Client<T> {
             ConfigChange::ClientChange(client_change) => match client_change {
                 ClientServiceChange::Add(cfg) => {
                     let name = cfg.name.clone();
+                    if let Some(previous) = self.service_handles.remove(&name) {
+                        previous.shutdown().await;
+                    }
                     let handle = ControlChannelHandle::new(
                         cfg,
                         self.config.remote_addr.clone(),
@@ -165,10 +169,12 @@ impl<T: 'static + Transport> Client<T> {
                         self.config.heartbeat_timeout,
                         self.event_tx.clone(),
                     );
-                    let _ = self.service_handles.insert(name, handle);
+                    self.service_handles.insert(name, handle);
                 }
                 ClientServiceChange::Delete(s) => {
-                    let _ = self.service_handles.remove(&s);
+                    if let Some(handle) = self.service_handles.remove(&s) {
+                        handle.shutdown().await;
+                    }
                 }
             },
             ignored => warn!("Ignored {:?} since running as a client", ignored),
@@ -221,7 +227,10 @@ async fn do_data_channel_handshake<T: Transport>(
     Ok(conn)
 }
 
-async fn run_data_channel<T: Transport>(args: Arc<RunDataChannelArgs<T>>) -> Result<()> {
+async fn run_data_channel<T: Transport>(
+    args: Arc<RunDataChannelArgs<T>>,
+    udp_tasks: &mut JoinSet<()>,
+) -> Result<()> {
     // Do the handshake
     let mut conn = do_data_channel_handshake(args.clone()).await?;
 
@@ -237,8 +246,13 @@ async fn run_data_channel<T: Transport>(args: Arc<RunDataChannelArgs<T>>) -> Res
             if args.service.service_type != ServiceType::Udp {
                 bail!("Expect UDP traffic. Please check the configuration.")
             }
-            run_data_channel_for_udp::<T>(conn, &args.service.local_addr, args.service.prefer_ipv6)
-                .await?;
+            run_data_channel_for_udp::<T>(
+                conn,
+                &args.service.local_addr,
+                args.service.prefer_ipv6,
+                udp_tasks,
+            )
+            .await?;
         }
     }
     Ok(())
@@ -270,6 +284,7 @@ async fn run_data_channel_for_udp<T: Transport>(
     conn: T::Stream,
     local_addr: &str,
     prefer_ipv6: bool,
+    tasks: &mut JoinSet<()>,
 ) -> Result<()> {
     debug!("New data channel starts forwarding");
 
@@ -283,7 +298,7 @@ async fn run_data_channel_for_udp<T: Transport>(
     let (mut rd, mut wr) = io::split(conn);
 
     // Keep sending items from the outbound channel to the server
-    tokio::spawn(async move {
+    tasks.spawn(async move {
         while let Some(t) = outbound_rx.recv().await {
             trace!("outbound {:?}", t);
             if let Err(e) = t
@@ -298,6 +313,7 @@ async fn run_data_channel_for_udp<T: Transport>(
     });
 
     loop {
+        while tasks.try_join_next().is_some() {}
         // Read a packet from the server
         let hdr_len = rd.read_u8().await?;
         let packet = UdpTraffic::read(&mut rd, hdr_len)
@@ -324,13 +340,12 @@ async fn run_data_channel_for_udp<T: Transport>(
                 Ok(s) => {
                     let (inbound_tx, inbound_rx) = mpsc::channel(UDP_SENDQ_SIZE);
                     m.insert(packet.from, inbound_tx);
-                    tokio::spawn(run_udp_forwarder(
-                        s,
-                        inbound_rx,
-                        outbound_tx.clone(),
-                        packet.from,
-                        port_map.clone(),
-                    ));
+                    let outbound = outbound_tx.clone();
+                    let from = packet.from;
+                    let map = port_map.clone();
+                    tasks.spawn(async move {
+                        let _ = run_udp_forwarder(s, inbound_rx, outbound, from, map).await;
+                    });
                 }
                 Err(e) => {
                     error!("{:#}", e);
@@ -401,19 +416,38 @@ async fn run_udp_forwarder(
 
 // Control channel, using T as the transport layer
 struct ControlChannel<T: Transport> {
-    digest: ServiceDigest,              // SHA256 of the service name
-    service: ClientServiceConfig,       // `[client.services.foo]` config block
-    shutdown_rx: oneshot::Receiver<u8>, // Receives the shutdown signal
-    remote_addr: String,                // `client.remote_addr`
-    transport: Arc<T>,                  // Wrapper around the transport layer
-    heartbeat_timeout: u64,             // Application layer heartbeat timeout in secs
+    digest: ServiceDigest,        // SHA256 of the service name
+    service: ClientServiceConfig, // `[client.services.foo]` config block
+    remote_addr: String,          // `client.remote_addr`
+    transport: Arc<T>,            // Wrapper around the transport layer
+    heartbeat_timeout: u64,       // Application layer heartbeat timeout in secs
     event_tx: Option<RatholeEventSender>,
+    data_tasks: JoinSet<()>,
+    data_shutdown_tx: broadcast::Sender<bool>,
 }
+
+#[derive(Debug)]
+enum TerminalControlChannelFailure {
+    AuthFailed,
+    ServiceNotExist,
+}
+
+impl std::fmt::Display for TerminalControlChannelFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::AuthFailed => "remote access authentication rejected",
+            Self::ServiceNotExist => "remote access service rejected",
+        })
+    }
+}
+
+impl std::error::Error for TerminalControlChannelFailure {}
 
 // Handle of a control channel
 // Dropping it will also drop the actual control channel
 struct ControlChannelHandle {
-    shutdown_tx: oneshot::Sender<u8>,
+    shutdown_tx: Option<oneshot::Sender<u8>>,
+    task: Option<JoinHandle<()>>,
 }
 
 impl<T: 'static + Transport> ControlChannel<T> {
@@ -458,40 +492,45 @@ impl<T: 'static + Transport> ControlChannel<T> {
             service: self.service.clone(),
         });
 
+        let heartbeat_interval = Duration::from_secs(self.heartbeat_timeout);
+        let heartbeat = time::sleep(heartbeat_interval);
+        tokio::pin!(heartbeat);
         loop {
-            tokio::select! {
-                val = read_control_cmd(&mut conn) => {
-                    let val = val?;
-                    debug!( "Received {:?}", val);
-                    match val {
-                        ControlChannelCmd::CreateDataChannel => {
-                            let args = data_ch_args.clone();
-                            tokio::spawn(async move {
-                                if let Err(e) = run_data_channel(args).await.with_context(|| "Failed to run the data channel") {
+            let val = next_control_command(
+                &mut conn,
+                &mut self.data_tasks,
+                heartbeat.as_mut(),
+                heartbeat_interval,
+            )
+            .await?;
+            debug!("Received {:?}", val);
+            match val {
+                ControlChannelCmd::CreateDataChannel => {
+                    let args = data_ch_args.clone();
+                    let mut shutdown = self.data_shutdown_tx.subscribe();
+                    self.data_tasks.spawn(async move {
+                        let mut udp_tasks = JoinSet::new();
+                        tokio::select! {
+                            biased;
+                            _ = shutdown.recv() => {},
+                            result = run_data_channel(args, &mut udp_tasks) => {
+                                if let Err(e) = result.with_context(|| "Failed to run the data channel") {
                                     warn!("{:#}", e);
                                 }
-                            }.instrument(Span::current()));
-                        },
-                        ControlChannelCmd::HeartBeat => ()
-                    }
-                },
-                _ = time::sleep(Duration::from_secs(self.heartbeat_timeout)), if self.heartbeat_timeout != 0 => {
-                    return Err(anyhow!("Heartbeat timed out"))
+                            }
+                        }
+                        udp_tasks.abort_all();
+                        while udp_tasks.join_next().await.is_some() {}
+                    }.instrument(Span::current()));
                 }
-                _ = &mut self.shutdown_rx => {
-                    break;
-                }
+                ControlChannelCmd::HeartBeat => (),
             }
         }
+    }
 
-        info!("Control channel shutdown");
-        send_client_event(
-            &self.event_tx,
-            RatholeClientEvent::ControlChannelStopped {
-                service_name: self.service.name.clone(),
-            },
-        );
-        Ok(())
+    async fn stop_data_channels(&mut self) {
+        let _ = self.data_shutdown_tx.send(true);
+        while self.data_tasks.join_next().await.is_some() {}
     }
 
     async fn establish_control_channel(&self) -> Result<(T::Stream, Nonce, AddrMaybeCached)> {
@@ -538,7 +577,7 @@ impl<T: 'static + Transport> ControlChannel<T> {
         match read_ack(&mut conn).await? {
             Ack::Ok => {}
             Ack::AuthFailed => {
-                let error = format!("Authentication failed: {}", self.service.name);
+                let error = TerminalControlChannelFailure::AuthFailed.to_string();
                 send_client_event(
                     &self.event_tx,
                     RatholeClientEvent::ControlChannelAuthFailed {
@@ -546,10 +585,10 @@ impl<T: 'static + Transport> ControlChannel<T> {
                         error: error.clone(),
                     },
                 );
-                return Err(anyhow!("{}", Ack::AuthFailed)).with_context(|| error);
+                return Err(TerminalControlChannelFailure::AuthFailed.into());
             }
             Ack::ServiceNotExist => {
-                let error = format!("Service does not exist: {}", self.service.name);
+                let error = TerminalControlChannelFailure::ServiceNotExist.to_string();
                 send_client_event(
                     &self.event_tx,
                     RatholeClientEvent::ControlChannelServiceNotExist {
@@ -557,11 +596,39 @@ impl<T: 'static + Transport> ControlChannel<T> {
                         error: error.clone(),
                     },
                 );
-                return Err(anyhow!("{}", Ack::ServiceNotExist)).with_context(|| error);
+                return Err(TerminalControlChannelFailure::ServiceNotExist.into());
             }
         }
 
         Ok((conn, session_key, remote_addr))
+    }
+}
+
+// Reaping a data task must not cancel read_exact's partially filled command buffer.
+// Only a complete command refreshes the session's persistent heartbeat deadline.
+async fn next_control_command<S: io::AsyncRead + io::AsyncWrite + Unpin>(
+    conn: &mut S,
+    data_tasks: &mut JoinSet<()>,
+    mut heartbeat: std::pin::Pin<&mut time::Sleep>,
+    heartbeat_interval: Duration,
+) -> Result<ControlChannelCmd> {
+    let command = read_control_cmd(conn);
+    tokio::pin!(command);
+    loop {
+        tokio::select! {
+            result = &mut command => {
+                let command = result?;
+                if !heartbeat_interval.is_zero() {
+                    heartbeat.as_mut().reset(Instant::now() + heartbeat_interval);
+                }
+                return Ok(command);
+            }
+            _ = heartbeat.as_mut(), if !heartbeat_interval.is_zero() => {
+                // The session ends; dropping the unfinished read is safe here.
+                return Err(anyhow!("Heartbeat timed out"));
+            }
+            _ = data_tasks.join_next(), if !data_tasks.is_empty() => {}
+        }
     }
 }
 
@@ -582,70 +649,96 @@ impl ControlChannelHandle {
             AuthType::Sha256 => protocol::digest(service.name.as_bytes()),
         };
 
-        info!("Starting {}", hex::encode(digest));
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        info!("Starting control channel");
+        let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
 
         let mut retry_backoff = run_control_chan_backoff(service.retry_interval.unwrap());
 
         let mut s = ControlChannel {
             digest,
             service,
-            shutdown_rx,
             remote_addr,
             transport,
             heartbeat_timeout,
             event_tx: event_tx.clone(),
+            data_tasks: JoinSet::new(),
+            data_shutdown_tx: broadcast::channel(1).0,
         };
 
-        tokio::spawn(
+        let task = tokio::spawn(
             async move {
-                let mut start = Instant::now();
+                loop {
+                    let start = Instant::now();
+                    // Cancellation covers DNS, connect, handshake and the established channel.
+                    let result = tokio::select! {
+                        biased;
+                        _ = &mut shutdown_rx => break,
+                        result = s.run() => result,
+                    };
+                    // A disconnected session must not retain forwarding tasks.
+                    s.stop_data_channels().await;
 
-                while let Err(err) = s
-                    .run()
-                    .await
-                    .with_context(|| "Failed to run the control channel")
-                {
-                    if s.shutdown_rx.try_recv() != Err(oneshot::error::TryRecvError::Empty) {
+                    let Err(err) = result else { break };
+                    if let Some(failure) = err.downcast_ref::<TerminalControlChannelFailure>() {
+                        // One useful, secret-free Sentry event, with no retry notification.
+                        error!(reason = %failure, "Remote access control channel rejected");
                         break;
                     }
-
                     if start.elapsed() > Duration::from_secs(3) {
-                        // The client runs for at least 3 secs and then disconnects
                         retry_backoff.reset();
                     }
-
                     if let Some(duration) = retry_backoff.next_backoff() {
-                        let error = format!("{err:#}");
-                        if should_publish_reconnecting_event(error.as_str()) {
-                            send_client_event(
-                                &event_tx,
-                                RatholeClientEvent::ControlChannelReconnecting {
-                                    service_name: service_name.clone(),
-                                    error: error.clone(),
-                                    retry_after_millis: duration_as_millis_u64(duration),
-                                },
-                            );
-                        }
+                        let error = format!("Failed to run the control channel: {err:#}");
+                        send_client_event(
+                            &event_tx,
+                            RatholeClientEvent::ControlChannelReconnecting {
+                                service_name: service_name.clone(),
+                                error: error.clone(),
+                                retry_after_millis: duration_as_millis_u64(duration),
+                            },
+                        );
                         error!("{error}. Retry in {:?}...", duration);
-                        time::sleep(duration).await;
+                        tokio::select! {
+                            biased;
+                            _ = &mut shutdown_rx => break,
+                            _ = time::sleep(duration) => {}
+                        }
                     } else {
-                        // Should never reach
-                        panic!("{:#}. Break", err);
+                        break;
                     }
-
-                    start = Instant::now();
                 }
+                s.stop_data_channels().await;
+                send_client_event(
+                    &event_tx,
+                    RatholeClientEvent::ControlChannelStopped { service_name },
+                );
             }
             .instrument(Span::current()),
         );
 
-        ControlChannelHandle { shutdown_tx }
+        ControlChannelHandle {
+            shutdown_tx: Some(shutdown_tx),
+            task: Some(task),
+        }
     }
 
-    fn shutdown(self) {
-        // A send failure shows that the actor has already shutdown.
-        let _ = self.shutdown_tx.send(0u8);
+    async fn shutdown(mut self) {
+        if let Some(tx) = self.shutdown_tx.take() {
+            let _ = tx.send(0);
+        }
+        if let Some(task) = self.task.as_mut() {
+            let _ = task.await;
+        }
+        self.task = None;
+    }
+}
+
+impl Drop for ControlChannelHandle {
+    fn drop(&mut self) {
+        // Cancellation of the owning future must never detach the control channel.
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
     }
 }
 
@@ -659,6 +752,126 @@ fn duration_as_millis_u64(duration: Duration) -> u64 {
     duration.as_millis().try_into().unwrap_or(u64::MAX)
 }
 
-fn should_publish_reconnecting_event(error: &str) -> bool {
-    !error.contains("Incorrect token") && !error.contains("Service not exist")
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use tokio::net::TcpListener;
+
+    // Tests the inner retry loop without Pioneer or an event-driven shutdown.
+    #[tokio::test]
+    async fn typed_rejections_stop_control_channel_retries_without_an_owner_shutdown() {
+        for ack in [Ack::AuthFailed, Ack::ServiceNotExist] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let remote_addr = listener.local_addr().unwrap().to_string();
+            let config = Config::from_str(&format!(
+                "[client]\nremote_addr = {remote_addr:?}\n[client.services.fixture]\nauth = \"token_hash\"\ntoken = \"local-test-key\"\nlocal_addr = \"127.0.0.1:1\"\n"
+            )).unwrap().client.unwrap();
+            let transport = Arc::new(TcpTransport::new(&config.transport).unwrap());
+            let service = config.services.get("fixture").unwrap().clone();
+            let (tx, mut events) = mpsc::unbounded_channel();
+            let mut handle =
+                ControlChannelHandle::new(service, remote_addr, transport, 0, Some(tx));
+            let (mut socket, _) = time::timeout(Duration::from_secs(2), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(
+                read_hello(&mut socket).await.unwrap(),
+                Hello::ControlChannelHello(..)
+            ));
+            socket
+                .write_all(
+                    &bincode::serialize(&Hello::ControlChannelHello(
+                        CURRENT_PROTO_VERSION,
+                        [7; 32],
+                    ))
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            let mut proof = [0; 32];
+            socket.read_exact(&mut proof).await.unwrap();
+            socket
+                .write_all(&bincode::serialize(&ack).unwrap())
+                .await
+                .unwrap();
+            let mut failures = 0;
+            time::timeout(Duration::from_secs(2), async {
+                loop {
+                    match events.recv().await.unwrap() {
+                        RatholeEvent::Client(RatholeClientEvent::ControlChannelAuthFailed {
+                            ..
+                        })
+                        | RatholeEvent::Client(
+                            RatholeClientEvent::ControlChannelServiceNotExist { .. },
+                        ) => failures += 1,
+                        RatholeEvent::Client(RatholeClientEvent::ControlChannelReconnecting {
+                            ..
+                        }) => panic!("terminal rejection scheduled a retry"),
+                        RatholeEvent::Client(RatholeClientEvent::ControlChannelStopped {
+                            ..
+                        }) => break,
+                        _ => {}
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(failures, 1);
+            time::timeout(Duration::from_secs(1), handle.task.as_mut().unwrap())
+                .await
+                .unwrap()
+                .unwrap();
+            handle.task = None;
+            // Covers several normal first-retry windows; no caller has sent shutdown yet.
+            assert!(time::timeout(Duration::from_secs(2), listener.accept())
+                .await
+                .is_err());
+            handle.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_joins_a_pending_handshake() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let remote_addr = listener.local_addr().unwrap().to_string();
+        let config = Config::from_str(&format!(
+            "[client]\nremote_addr = {remote_addr:?}\n[client.services.fixture]\ntoken = \"local-test-key\"\nlocal_addr = \"127.0.0.1:1\"\n"
+        )).unwrap();
+        let (shutdown, rx) = broadcast::channel(1);
+        let task = tokio::spawn(crate::run_config(
+            config,
+            crate::Cli {
+                client: true,
+                ..Default::default()
+            },
+            rx,
+        ));
+        let (mut socket, _) = time::timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        read_hello(&mut socket).await.unwrap(); // Leave the nonce unread for the client.
+        shutdown.send(true).unwrap();
+        time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let mut byte = [0];
+        assert_eq!(
+            time::timeout(Duration::from_secs(1), socket.read(&mut byte))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        assert!(time::timeout(Duration::from_secs(1), listener.accept())
+            .await
+            .is_err());
+    }
 }
+
+#[cfg(test)]
+#[path = "client/control_session_tests.rs"]
+mod control_session_tests;
