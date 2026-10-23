@@ -56,6 +56,7 @@ pub async fn run_relay(
 #[derive(Debug, Clone)]
 struct RelayTunnelRuntime {
     id: String,
+    public_base_url: String,
     host: String,
     token_hash: protocol::Digest,
     service: ServerServiceConfig,
@@ -97,6 +98,7 @@ impl RelayRegistry {
                 token_id,
                 RelayTunnelRuntime {
                     id: tunnel.id.clone(),
+                    public_base_url: tunnel.url.to_string(),
                     host,
                     token_hash,
                     service,
@@ -305,6 +307,7 @@ async fn do_control_channel_handshake(
     }
     conn.write_all(&bincode::serialize(&Ack::Ok).unwrap())
         .await?;
+    protocol::write_control_metadata(&mut conn, Some(&tunnel.public_base_url)).await?;
     conn.flush().await?;
 
     info!(tunnel = %tunnel.id, host = %tunnel.host, "relay control channel established");

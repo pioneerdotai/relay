@@ -345,6 +345,7 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
         // Send ack
         conn.write_all(&bincode::serialize(&Ack::Ok).unwrap())
             .await?;
+        protocol::write_control_metadata(&mut conn, None).await?;
         conn.flush().await?;
 
         info!(service = %service_config.name, "Control channel established");

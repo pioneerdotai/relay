@@ -426,7 +426,7 @@ impl<T: 'static + Transport> ControlChannel<T> {
             },
         );
 
-        let (mut conn, session_key, remote_addr) = time::timeout(
+        let (mut conn, session_key, remote_addr, public_base_url) = time::timeout(
             CONTROL_CHANNEL_HANDSHAKE_TIMEOUT,
             self.establish_control_channel(),
         )
@@ -445,6 +445,7 @@ impl<T: 'static + Transport> ControlChannel<T> {
             &self.event_tx,
             RatholeClientEvent::ControlChannelConnected {
                 service_name: self.service.name.clone(),
+                public_base_url,
             },
         );
 
@@ -494,7 +495,9 @@ impl<T: 'static + Transport> ControlChannel<T> {
         Ok(())
     }
 
-    async fn establish_control_channel(&self) -> Result<(T::Stream, Nonce, AddrMaybeCached)> {
+    async fn establish_control_channel(
+        &self,
+    ) -> Result<(T::Stream, Nonce, AddrMaybeCached, Option<String>)> {
         let mut remote_addr = AddrMaybeCached::new(&self.remote_addr);
         remote_addr.resolve().await?;
 
@@ -561,7 +564,12 @@ impl<T: 'static + Transport> ControlChannel<T> {
             }
         }
 
-        Ok((conn, session_key, remote_addr))
+        let public_base_url = protocol::read_control_metadata(&mut conn).await?;
+        if matches!(self.service.auth, AuthType::TokenHash) && public_base_url.is_none() {
+            bail!("relay authentication response omitted the public URL");
+        }
+
+        Ok((conn, session_key, remote_addr, public_base_url))
     }
 }
 
