@@ -48,6 +48,7 @@ pub enum RatholeClientEvent {
     },
     ControlChannelConnected {
         service_name: String,
+        public_base_url: Option<String>,
     },
     ControlChannelReconnecting {
         service_name: String,

@@ -10,9 +10,9 @@ use tracing::trace;
 
 type ProtocolVersion = u8;
 const _PROTO_V0: u8 = 0u8;
-const PROTO_V1: u8 = 1u8;
+const PROTO_V2: u8 = 2u8;
 
-pub const CURRENT_PROTO_VERSION: ProtocolVersion = PROTO_V1;
+pub const CURRENT_PROTO_VERSION: ProtocolVersion = PROTO_V2;
 
 pub type Digest = [u8; HASH_WIDTH_IN_BYTES];
 
@@ -222,6 +222,74 @@ pub async fn read_ack<T: AsyncRead + AsyncWrite + Unpin>(conn: &mut T) -> Result
     bincode::deserialize(&bytes).with_context(|| "Failed to deserialize ack")
 }
 
+// V2 retains fixed-size Hello/Auth/Ack packets. After Ack::Ok, a u16 big-endian
+// length frames the authenticated UTF-8 public URL. Zero denotes a legacy
+// service server without public URL metadata. Never parse it as a control cmd.
+pub const MAX_PUBLIC_BASE_URL_BYTES: usize = 8192;
+
+pub fn validate_public_base_url(value: &str) -> Result<()> {
+    if value.len() > MAX_PUBLIC_BASE_URL_BYTES
+        || value
+            .chars()
+            .any(|ch| ch.is_whitespace() || ch.is_control())
+    {
+        bail!("invalid public relay URL");
+    }
+    let url = url::Url::parse(value).map_err(|_| anyhow::anyhow!("invalid public relay URL"))?;
+    let unspecified = match url.host() {
+        Some(url::Host::Ipv4(address)) => address.is_unspecified(),
+        Some(url::Host::Ipv6(address)) => address.is_unspecified(),
+        _ => false,
+    };
+    if url.scheme() != "https"
+        || url.host_str().is_none()
+        || unspecified
+        || url.port() == Some(0)
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        bail!("invalid public relay URL");
+    }
+    Ok(())
+}
+
+pub async fn write_control_metadata<T: AsyncWrite + Unpin>(
+    conn: &mut T,
+    public_base_url: Option<&str>,
+) -> Result<()> {
+    if let Some(value) = public_base_url {
+        validate_public_base_url(value)?;
+    }
+    let bytes = public_base_url.unwrap_or_default().as_bytes();
+    conn.write_u16(bytes.len() as u16).await?;
+    conn.write_all(bytes).await?;
+    Ok(())
+}
+
+pub async fn read_control_metadata<T: AsyncRead + Unpin>(conn: &mut T) -> Result<Option<String>> {
+    let len = usize::from(
+        conn.read_u16()
+            .await
+            .context("failed to read control metadata length")?,
+    );
+    if len > MAX_PUBLIC_BASE_URL_BYTES {
+        bail!("public relay URL exceeds protocol limit");
+    }
+    if len == 0 {
+        return Ok(None);
+    }
+    let mut bytes = vec![0; len];
+    conn.read_exact(&mut bytes)
+        .await
+        .context("failed to read control metadata")?;
+    let value = String::from_utf8(bytes)
+        .map_err(|_| anyhow::anyhow!("invalid public relay URL encoding"))?;
+    validate_public_base_url(&value)?;
+    Ok(Some(value))
+}
+
 pub async fn read_control_cmd<T: AsyncRead + AsyncWrite + Unpin>(
     conn: &mut T,
 ) -> Result<ControlChannelCmd> {
@@ -240,4 +308,76 @@ pub async fn read_data_cmd<T: AsyncRead + AsyncWrite + Unpin>(
         .await
         .with_context(|| "Failed to read cmd")?;
     bincode::deserialize(&bytes).with_context(|| "Failed to deserialize data cmd")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn authenticated_metadata_preserves_prefix_and_next_control_packet() {
+        let (mut writer, mut reader) = tokio::io::duplex(16384);
+        let base = "https://[2001:db8::1]:8443/pioneer/edge/";
+        writer
+            .write_all(&bincode::serialize(&Ack::Ok).unwrap())
+            .await
+            .unwrap();
+        write_control_metadata(&mut writer, Some(base))
+            .await
+            .unwrap();
+        writer
+            .write_all(&bincode::serialize(&ControlChannelCmd::HeartBeat).unwrap())
+            .await
+            .unwrap();
+        assert!(matches!(read_ack(&mut reader).await.unwrap(), Ack::Ok));
+        assert_eq!(
+            read_control_metadata(&mut reader).await.unwrap().as_deref(),
+            Some(base)
+        );
+        assert!(matches!(
+            read_control_cmd(&mut reader).await.unwrap(),
+            ControlChannelCmd::HeartBeat
+        ));
+
+        write_control_metadata(&mut writer, None).await.unwrap();
+        assert_eq!(read_control_metadata(&mut reader).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn invalid_control_metadata_and_old_version_are_rejected() {
+        for bytes in [
+            b"https://user:secret@example.invalid/".as_slice(),
+            b"https://example.invalid/?query".as_slice(),
+            b"https://example.invalid/#fragment".as_slice(),
+            b"relay.example.invalid:2333".as_slice(),
+            b"http://example.invalid/".as_slice(),
+            b"https://0.0.0.0/".as_slice(),
+            b"https://[::]/".as_slice(),
+            &[0xff, 0xfe],
+        ] {
+            let (mut writer, mut reader) = tokio::io::duplex(16384);
+            writer.write_u16(bytes.len() as u16).await.unwrap();
+            writer.write_all(bytes).await.unwrap();
+            assert!(read_control_metadata(&mut reader).await.is_err());
+        }
+        let (mut writer, mut reader) = tokio::io::duplex(16384);
+        writer
+            .write_u16((MAX_PUBLIC_BASE_URL_BYTES + 1) as u16)
+            .await
+            .unwrap();
+        assert!(read_control_metadata(&mut reader).await.is_err());
+
+        let (mut writer, mut reader) = tokio::io::duplex(16384);
+        writer.write_u16(100).await.unwrap();
+        writer.write_all(b"truncated").await.unwrap();
+        drop(writer);
+        assert!(read_control_metadata(&mut reader).await.is_err());
+
+        let (mut writer, mut reader) = tokio::io::duplex(16384);
+        writer
+            .write_all(&bincode::serialize(&Hello::ControlChannelHello(1, [0; 32])).unwrap())
+            .await
+            .unwrap();
+        assert!(read_hello(&mut reader).await.is_err());
+    }
 }

@@ -376,6 +376,8 @@ impl Config {
                 );
             }
 
+            crate::protocol::validate_public_base_url(tunnel.url.as_str())?;
+
             let host = tunnel
                 .url
                 .host_str()
