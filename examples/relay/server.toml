@@ -1,6 +1,9 @@
 [relay]
 control_addr = "0.0.0.0:2333"
 ingress_addr = "127.0.0.1:8080"
+# Optional shared WebRTC ingress. Replace the advertised example address.
+# media_bind_addr = "0.0.0.0:3479"
+# media_public_addr = "192.0.2.1:3479"
 
 [[relay.tunnels]]
 id = "pioneer_gateway"
