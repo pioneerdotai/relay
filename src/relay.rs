@@ -26,6 +26,9 @@ use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
 use tokio::time;
 use tracing::{debug, error, info, info_span, instrument, warn, Instrument, Span};
 
+#[path = "relay_media.rs"]
+mod media;
+
 type TokenId = protocol::Digest;
 type Nonce = protocol::Digest;
 type ControlChannelMap = MultiMap<TokenId, Nonce, Arc<RelayControlChannelHandle>>;
@@ -152,6 +155,20 @@ impl RelayServer {
             "relay listening"
         );
 
+        let media = match (self.config.media_bind_addr, self.config.media_public_addr) {
+            (Some(bind), Some(public)) => Some(media::Ingress::bind(bind, public).await?),
+            _ => None,
+        };
+        let (media_shutdown, _) = tokio::sync::watch::channel(());
+        let media_loop = async {
+            if let Some(media) = &media {
+                media.run().await
+            } else {
+                std::future::pending().await
+            }
+        };
+        tokio::pin!(media_loop);
+
         let mut backoff = ExponentialBackoff {
             max_interval: Duration::from_millis(100),
             max_elapsed_time: None,
@@ -208,12 +225,16 @@ impl RelayServer {
                             let registry = self.registry.clone();
                             let control_channels = self.control_channels.clone();
                             let max_header_bytes = self.config.max_header_bytes;
+                            let media = media.clone();
+                            let media_shutdown = media_shutdown.subscribe();
                             tokio::spawn(async move {
                                 if let Err(err) = handle_ingress_connection(
                                     visitor,
                                     registry,
                                     control_channels,
                                     max_header_bytes,
+                                    media,
+                                    media_shutdown,
                                 ).await {
                                     debug!(%addr, "{err:#}");
                                 }
@@ -224,6 +245,7 @@ impl RelayServer {
                         }
                     }
                 }
+                error = &mut media_loop => return Err(error),
                 _ = shutdown_rx.recv() => {
                     info!("shutting down relay gracefully...");
                     break;
@@ -299,7 +321,8 @@ async fn do_control_channel_handshake(
     }
 
     let mut channels = control_channels.write().await;
-    if channels.remove1(&token_id).is_some() {
+    if let Some(previous) = channels.remove1(&token_id) {
+        let _ = previous.shutdown_tx.send(true);
         warn!(
             "dropping previous relay control channel for `{}`",
             tunnel.id
@@ -346,7 +369,8 @@ async fn do_data_channel_handshake(
 }
 
 struct RelayControlChannelHandle {
-    _shutdown_tx: broadcast::Sender<bool>,
+    shutdown_tx: broadcast::Sender<bool>,
+    closed: tokio::sync::watch::Receiver<()>,
     data_ch_tx: mpsc::Sender<TcpStream>,
     data_ch_rx: Mutex<mpsc::Receiver<TcpStream>>,
     data_ch_req_tx: mpsc::UnboundedSender<bool>,
@@ -375,8 +399,10 @@ impl RelayControlChannelHandle {
             heartbeat_interval,
         };
 
+        let (alive, closed) = tokio::sync::watch::channel(());
         tokio::spawn(
             async move {
+                let _alive = alive;
                 if let Err(err) = control.run().await {
                     error!("{err:#}");
                 }
@@ -385,7 +411,8 @@ impl RelayControlChannelHandle {
         );
 
         Self {
-            _shutdown_tx: shutdown_tx,
+            shutdown_tx,
+            closed,
             data_ch_tx,
             data_ch_rx: Mutex::new(data_ch_rx),
             data_ch_req_tx,
@@ -432,8 +459,10 @@ impl RelayControlChannel {
         let create_ch_cmd = bincode::serialize(&ControlChannelCmd::CreateDataChannel).unwrap();
         let heartbeat = bincode::serialize(&ControlChannelCmd::HeartBeat).unwrap();
 
+        let mut unexpected = [0];
         loop {
             tokio::select! {
+                _ = self.conn.read(&mut unexpected) => break,
                 request = self.data_ch_req_rx.recv() => {
                     if request.is_none() {
                         break;
@@ -463,6 +492,8 @@ async fn handle_ingress_connection(
     registry: Arc<RelayRegistry>,
     control_channels: Arc<RwLock<ControlChannelMap>>,
     max_header_bytes: usize,
+    media: Option<Arc<media::Ingress>>,
+    mut media_shutdown: tokio::sync::watch::Receiver<()>,
 ) -> Result<()> {
     let prefix =
         match read_http_prefix(&mut visitor, max_header_bytes, INGRESS_HEADER_TIMEOUT).await {
@@ -507,6 +538,26 @@ async fn handle_ingress_connection(
             bail!("relay tunnel for `{host}` is not connected");
         }
     };
+
+    if media::is_media_request(&prefix) {
+        let Some(media) = media else {
+            write_http_error(&mut visitor, 503, "Service Unavailable").await?;
+            return Ok(());
+        };
+        if !media::validate_upgrade(&prefix) {
+            write_http_error(&mut visitor, 400, "Bad Request").await?;
+            return Ok(());
+        }
+        let mut closed = handle.closed.clone();
+        drop(handle);
+        drop(control_channels);
+        let tunnel = &registry.by_token_id[&token_id];
+        return tokio::select! {
+            _ = closed.changed() => Ok(()),
+            _ = media_shutdown.changed() => Ok(()),
+            result = media.serve(visitor, token_id, &tunnel.token_hash) => result,
+        };
+    }
 
     let mut data_channel =
         match wait_for_data_channel(handle.open_tcp_data_channel(), INGRESS_DATA_CHANNEL_TIMEOUT)

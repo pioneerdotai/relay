@@ -296,3 +296,35 @@ For more details, see the separate page [Benchmark](./docs/benchmark.md).
 - [ ] HTTP APIs for configuration
 
 [Out of Scope](./docs/out-of-scope.md) lists features that are not planned to be implemented and why.
+
+### Pioneer call media in special Relay mode
+
+Set both `media_bind_addr` and `media_public_addr` in `[relay]` to enable
+one shared IPv4 UDP ingress for the configured tunnels. Use the externally
+reachable IPv4 address and UDP port in `media_public_addr`. Forward that
+UDP port to the bind address if Relay is behind NAT. The Gateway's LiveKit
+HTTP and UDP sockets use loopback in this mode.
+
+The HTTPS edge must route `<public Gateway prefix>/_pioneer/call-media/v1`
+to the same ingress as the Gateway, with the public prefix removed and Host
+preserved. Forward HTTP/1.1 Upgrade and Connection headers and carry the
+upgraded stream in both directions. The Nginx example's existing prefix
+and upgrade forwarding covers this request. Keep the raw HTTP ingress on
+a trusted link behind the TLS edge. The upgraded stream authenticates
+against the active Gateway tunnel's token verifier using a fresh
+challenge. Proofs are independent of the regular TCP control protocol.
+
+Each admitted signaling connection owns its ICE fragments. The Gateway sends
+a full replacement set and waits for Relay's acknowledgment before releasing
+SDP to the client. A conflicting fragment terminates the claimant's stream.
+A STUN binding response from the owning Gateway reserves the remote UDP
+tuple for that signaling session and ICE fragment. Before confirmation, the
+tuple can only carry ICE checks. Unconfirmed tuples expire after 10 seconds,
+confirmed tuples after 90 seconds without a successful binding response.
+The Gateway tunnel's closure or replacement also closes its media streams.
+Each session is limited to 16 routes and 16 public tuples.
+
+Media control and tunneled datagrams use bounded frames over the upgraded
+stream. WebRTC media is still protected by DTLS/SRTP. A shared UDP tuple
+cannot be used by multiple independent ICE transports at once. The Relay
+does not expose an ICE/TCP or TURN endpoint through this ingress.

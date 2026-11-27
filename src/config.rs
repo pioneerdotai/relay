@@ -271,6 +271,8 @@ pub struct RelayTunnelConfig {
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct RelayConfig {
+    pub media_bind_addr: Option<std::net::SocketAddrV4>,
+    pub media_public_addr: Option<std::net::SocketAddrV4>,
     #[serde(default = "default_relay_control_addr")]
     pub control_addr: String,
     #[serde(default = "default_relay_ingress_addr")]
@@ -341,6 +343,17 @@ impl Config {
 
         if !(1024..=MAX_RELAY_HEADER_BYTES).contains(&relay.max_header_bytes) {
             bail!("`relay.max_header_bytes` must be between 1024 and {MAX_RELAY_HEADER_BYTES}");
+        }
+
+        match (relay.media_bind_addr, relay.media_public_addr) {
+            (None, None) => {}
+            (Some(bind), Some(public))
+                if bind.port() != 0
+                    && public.port() != 0
+                    && !public.ip().is_unspecified()
+                    && !public.ip().is_multicast()
+                    && !public.ip().is_broadcast() => {}
+            _ => bail!("relay media requires a UDP bind address and an advertised IPv4 endpoint"),
         }
 
         if relay.tunnels.is_empty() {
